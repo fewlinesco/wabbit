@@ -52,7 +52,7 @@ defmodule Wabbit.Connection do
         {:ok, %{state | conn: conn}}
       {:error, reason} ->
         :error_logger.format("Connection error: ~s~n", [reason])
-        {:backoff, 1_000, state}
+        System.halt(1)
     end
   end
 
