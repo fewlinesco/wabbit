@@ -1,6 +1,7 @@
 defmodule Wabbit.Connection do
   use Connection
   import Wabbit.Record
+  require Logger
 
   @doc """
   Starts a new connection
@@ -49,9 +50,20 @@ defmodule Wabbit.Connection do
     case open(state.opts) do
       {:ok, conn} ->
         true = Process.link(conn)
-        {:ok, %{state | conn: conn, retry: 0, fallback_opts: List.delete(state.init_opts, state.opts)}}
+
+        {:ok,
+         %{
+           state
+           | conn: conn,
+             retry: 0,
+             fallback_opts:
+               state.init_opts
+               |> List.delete(state.opts)
+               |> Enum.shuffle()
+         }}
+
       {:error, reason} ->
-        :error_logger.format("Connection error: ~s~n", [reason])
+        Logger.info("Wabbit: Connection error on #{loggable_opts(state.opts)} #{inspect(reason)}")
         retry(state)
     end
   end
@@ -61,13 +73,17 @@ defmodule Wabbit.Connection do
       {:close, from} ->
         :ok = :amqp_connection.close(state.conn)
         Connection.reply(from, :ok)
+
       {:error, :closed} ->
-        :error_logger.format("Connection closed~n", [])
+        Logger.info("Wabbit: Connection closed on #{loggable_opts(state.opts)}")
+
       {:error, :killed} ->
-        :error_logger.info_msg("Connection closed: shutdown~n", [])
+        Logger.info("Wabbit: Connection closed on #{loggable_opts(state.opts)} : shutdown~n")
+
       {:error, reason} ->
-        :error_logger.format("Connection error: ~s~n", [reason])
+        Logger.info("Wabbit: Connection error on #{loggable_opts(state.opts)} #{inspect(reason)}")
     end
+
     {:connect, :reconnect, %{state | conn: nil, channels: %{}}}
   end
 
@@ -81,25 +97,67 @@ defmodule Wabbit.Connection do
   def init(opts) do
     {current_opts, fallback_opts} =
       cond do
-        Keyword.keyword?(opts) -> {opts, []}
-        is_binary(opts) -> {opts, []}
-        is_list(opts) && !Keyword.keyword?(opts) -> {hd(opts), tl(opts)}
-        # add defensive
+        Keyword.keyword?(opts) ->
+          {opts, []}
+
+        is_binary(opts) ->
+          {opts, []}
+
+        is_list(opts) && !Keyword.keyword?(opts) ->
+          opts = Enum.shuffle(opts)
+          {hd(opts), tl(opts)}
+
+        true ->
+          raise "Wabbit: unable to parse opts"
       end
+
     Process.flag(:trap_exit, true)
-    state = %{conn: nil, opts: current_opts, channels: %{}, fallback_opts: fallback_opts, init_opts: opts, retry: 0}
+
+    state = %{
+      conn: nil,
+      opts: current_opts,
+      channels: %{},
+      fallback_opts: fallback_opts,
+      init_opts: opts,
+      retry: 0
+    }
+
     {:connect, :init, state}
   end
 
   defp retry(state) do
     max_retry = 5
+
     cond do
-      state.retry > max_retry && Enum.empty?(state.fallback_opts) ->
+      state.retry >= max_retry && Enum.empty?(state.fallback_opts) ->
         System.halt(1)
-      state.retry > max_retry ->
-        state = %{state | retry: 0, opts: hd(state.fallback_opts), fallback_opts: tl(state.fallback_opts)}
-        {:backoff, 1_000, state}
-      true -> {:backoff, 1_000 + (1_000 * state.retry), %{state | retry: state.retry + 1}}
+
+      state.retry >= max_retry ->
+        backoff_time = 1_000
+
+        state = %{
+          state
+          | retry: 0,
+            opts: hd(state.fallback_opts),
+            fallback_opts: tl(state.fallback_opts)
+        }
+
+        Logger.info(
+          "Wabbit: retrying to connect in #{backoff_time / 1000}s on #{loggable_opts(state.opts)}"
+        )
+
+        {:backoff, backoff_time, state}
+
+      true ->
+        backoff_time = 1_000 + 1_000 * state.retry
+
+        Logger.info(
+          "Wabbit: retrying to reconnect in #{backoff_time / 1000}s on #{
+            loggable_opts(state.opts)
+          }"
+        )
+
+        {:backoff, backoff_time, %{state | retry: state.retry + 1}}
     end
   end
 
@@ -114,12 +172,14 @@ defmodule Wabbit.Connection do
           monitor_ref = Process.monitor(from)
           channels = Map.put(state.channels, monitor_ref, chan)
           {:reply, {:ok, chan}, %{state | channels: channels}}
+
         other ->
           {:reply, other, state}
       end
     catch
       :exit, {:noproc, _} ->
         {:reply, {:error, :closed}, state}
+
       _, _ ->
         {:reply, {:error, :closed}, state}
     end
@@ -129,7 +189,10 @@ defmodule Wabbit.Connection do
     {:disconnect, {:close, from}, state}
   end
 
-  def handle_info({:EXIT, conn, {:shutdown, {:server_initiated_close, _, _}}}, %{conn: conn} = state) do
+  def handle_info(
+        {:EXIT, conn, {:shutdown, {:server_initiated_close, _, _}}},
+        %{conn: conn} = state
+      ) do
     {:disconnect, {:error, :server_initiated_close}, state}
   end
 
@@ -144,15 +207,19 @@ defmodule Wabbit.Connection do
   def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
     state =
       case Map.get(state.channels, monitor_ref) do
-        nil -> state
+        nil ->
+          state
+
         pid ->
           try do
             :ok = :amqp_channel.close(pid)
           catch
             _, _ -> :ok
           end
+
           %{state | channels: Map.delete(state.channels, monitor_ref)}
       end
+
     {:noreply, state}
   end
 
@@ -164,34 +231,53 @@ defmodule Wabbit.Connection do
     :amqp_connection.close(state.conn)
   end
 
+  defp loggable_opts(opts) when is_binary(opts) do
+    uri = URI.parse(opts)
+    "#{uri.host || "nohost"}:#{uri.port || "noport"}"
+  end
+
+  defp loggable_opts(opts) do
+    if Keyword.keyword?(opts) do
+      "#{opts[:host] || "nohost"}:#{opts[:port] || "noport"}"
+    else
+      "could not parse connection opts"
+    end
+  end
+
   defp open(options) when is_list(options) do
     options = options |> normalize_ssl_options
 
     amqp_params =
       amqp_params_network(
-        username:           Keyword.get(options, :username,           "guest"),
-        password:           Keyword.get(options, :password,           "guest"),
-        virtual_host:       Keyword.get(options, :virtual_host,       "/"),
-        host:               Keyword.get(options, :host,               'localhost') |> to_charlist,
-        port:               Keyword.get(options, :port,               :undefined),
-        channel_max:        Keyword.get(options, :channel_max,        0),
-        frame_max:          Keyword.get(options, :frame_max,          0),
-        heartbeat:          Keyword.get(options, :heartbeat,          0),
+        username: Keyword.get(options, :username, "guest"),
+        password: Keyword.get(options, :password, "guest"),
+        virtual_host: Keyword.get(options, :virtual_host, "/"),
+        host: Keyword.get(options, :host, 'localhost') |> to_charlist,
+        port: Keyword.get(options, :port, :undefined),
+        channel_max: Keyword.get(options, :channel_max, 0),
+        frame_max: Keyword.get(options, :frame_max, 0),
+        heartbeat: Keyword.get(options, :heartbeat, 0),
         connection_timeout: Keyword.get(options, :connection_timeout, :infinity),
-        ssl_options:        Keyword.get(options, :ssl_options,        :none),
-        client_properties:  Keyword.get(options, :client_properties,  []),
-        socket_options:     Keyword.get(options, :socket_options,     []),
-        auth_mechanisms:    Keyword.get(options, :auth_mechanisms,    [&:amqp_auth_mechanisms.plain/3, &:amqp_auth_mechanisms.amqplain/3]))
+        ssl_options: Keyword.get(options, :ssl_options, :none),
+        client_properties: Keyword.get(options, :client_properties, []),
+        socket_options: Keyword.get(options, :socket_options, []),
+        auth_mechanisms:
+          Keyword.get(options, :auth_mechanisms, [
+            &:amqp_auth_mechanisms.plain/3,
+            &:amqp_auth_mechanisms.amqplain/3
+          ])
+      )
 
     case :amqp_connection.start(amqp_params) do
       {:ok, pid} -> {:ok, pid}
-      error      -> error
+      error -> error
     end
   end
+
   defp open(uri) when is_binary(uri) do
-    case uri |> to_charlist |> :amqp_uri.parse do
+    case uri |> to_charlist |> :amqp_uri.parse() do
       {:ok, amqp_params} -> amqp_params |> amqp_params_network |> open
-      error              -> error
+      error -> error
     end
   end
 
@@ -204,5 +290,6 @@ defmodule Wabbit.Connection do
       end
     end
   end
+
   defp normalize_ssl_options(options), do: options
 end
