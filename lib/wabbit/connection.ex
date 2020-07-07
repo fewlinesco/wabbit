@@ -49,10 +49,10 @@ defmodule Wabbit.Connection do
     case open(state.opts) do
       {:ok, conn} ->
         true = Process.link(conn)
-        {:ok, %{state | conn: conn}}
+        {:ok, %{state | conn: conn, retry: 0, fallback_opts: List.delete(state.init_opts, state.opts)}}
       {:error, reason} ->
         :error_logger.format("Connection error: ~s~n", [reason])
-        System.halt(1)
+        retry(state)
     end
   end
 
@@ -79,9 +79,28 @@ defmodule Wabbit.Connection do
   end
 
   def init(opts) do
+    {current_opts, fallback_opts} =
+      cond do
+        Keyword.keyword?(opts) -> {opts, []}
+        is_binary(opts) -> {opts, []}
+        is_list(opts) && !Keyword.keyword?(opts) -> {hd(opts), tl(opts)}
+        # add defensive
+      end
     Process.flag(:trap_exit, true)
-    state = %{conn: nil, opts: opts, channels: %{}}
+    state = %{conn: nil, opts: current_opts, channels: %{}, fallback_opts: fallback_opts, init_opts: opts, retry: 0}
     {:connect, :init, state}
+  end
+
+  defp retry(state) do
+    max_retry = 5
+    cond do
+      state.retry > max_retry && Enum.empty?(state.fallback_opts) ->
+        System.halt(1)
+      state.retry > max_retry ->
+        state = %{state | retry: 0, opts: hd(state.fallback_opts), fallback_opts: tl(state.fallback_opts)}
+        {:backoff, 1_000, state}
+      true -> {:backoff, 1_000 + (1_000 * state.retry), %{state | retry: state.retry + 1}}
+    end
   end
 
   def handle_call(_, _, %{conn: nil} = state) do
