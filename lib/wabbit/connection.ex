@@ -51,6 +51,8 @@ defmodule Wabbit.Connection do
       {:ok, conn} ->
         true = Process.link(conn)
 
+        Logger.info("Wabbit: Connection succeed on #{loggable_opts(state.opts)}")
+
         {:ok,
          %{
            state
