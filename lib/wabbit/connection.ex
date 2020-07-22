@@ -97,17 +97,17 @@ defmodule Wabbit.Connection do
   end
 
   def init(opts) do
-    {current_opts, fallback_opts} =
+    {current_opts, fallback_opts, init_opts} =
       cond do
         Keyword.keyword?(opts) ->
-          {opts, []}
+          {opts, [], [opts]}
 
         is_binary(opts) ->
-          {opts, []}
+          {opts, [], [opts]}
 
         is_list(opts) && !Keyword.keyword?(opts) ->
           opts = Enum.shuffle(opts)
-          {hd(opts), tl(opts)}
+          {hd(opts), tl(opts), opts}
 
         true ->
           raise "Wabbit: unable to parse opts"
@@ -120,7 +120,7 @@ defmodule Wabbit.Connection do
       opts: current_opts,
       channels: %{},
       fallback_opts: fallback_opts,
-      init_opts: opts,
+      init_opts: init_opts,
       retry: 0
     }
 
